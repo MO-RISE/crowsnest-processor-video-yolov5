@@ -1,6 +1,8 @@
 """Main entrypoint for this application"""
 import warnings
 import logging
+import time
+from datetime import datetime, timezone
 
 import yolov5
 from vidgear.gears import CamGear
@@ -17,65 +19,93 @@ YOLOV5_CONFIDENCE_THRESHOLD: float = env.float(
     "YOLOV5_CONFIDENCE_THRESHOLD", default=0.5, validate=lambda x: 0.0 <= x <= 1.0
 )
 YOLOV5_MAX_DETECTIONS: int = env.int(
-    "YOLOV5_MAX_DETECTIONS", default=10, validate=lambda x: x > 0
+    "YOLOV5_MAX_DETECTIONS", default=100, validate=lambda x: x > 0
 )
+YOLOV5_DEVICE: str = env("YOLOV5_DEVICE", default="cpu")
+YOLOV5_FRAMERATE: float = env.float("YOLOV5_FRAMERATE", default=1)
+
 LOG_LEVEL = env.log_level("LOG_LEVEL", logging.WARNING)
+FFMPEG_OUTPUT = env.bool("FFMPEG_OUTPUT", default=False)
+
 
 verbose = LOG_LEVEL <= logging.INFO
 
 # Setup logger
-logging.basicConfig(level=LOG_LEVEL)
+logging.basicConfig(level=LOG_LEVEL, force=True)
 logging.captureWarnings(True)
-warnings.filterwarnings("once")
+warnings.filterwarnings("ignore")
 LOGGER = logging.getLogger("crowsnest-processor-video-yolov5")
 
 ### Configure yolov5 model
-MODEL = yolov5.load(YOLOV5_MODEL)
+MODEL = yolov5.load(YOLOV5_MODEL, device=YOLOV5_DEVICE, verbose=verbose)
 
-MODEL.conf = 0.25  # NMS confidence threshold
+MODEL.conf = YOLOV5_CONFIDENCE_THRESHOLD  # NMS confidence threshold
 MODEL.iou = 0.45  # NMS IoU threshold
 MODEL.agnostic = False  # NMS class-agnostic
 MODEL.multi_label = False  # NMS multiple labels per box
-MODEL.max_det = 10  # maximum number of detections per image
+MODEL.max_det = YOLOV5_MAX_DETECTIONS  # maximum number of detections per image
 
 
-if __name__ == "__main__":
+try:
 
-    try:
+    # Open source stream, we always want the last frame since we
+    # cant guarantee to keep up with the source frame rate
+    source = CamGear(
+        source=SOURCE_STREAM,
+        colorspace="COLOR_BGR2RGB",
+        logging=verbose or FFMPEG_OUTPUT,
+        **{"THREADED_QUEUE_MODE": False, "-fflags": "nobuffer"}
+    ).start()
 
-        # Open source stream, we always want the last frame since we
-        # cant guarantee to keep up with the source frame rate
-        source = CamGear(
-            source=SOURCE_STREAM,
-            colorspace="COLOR_BGR2RGB",
-            logging=verbose,
-            **{"THREADED_QUEUE_MODE": False}
-        ).start()
+    sink = WriteGear(
+        output_filename=SINK_STREAM,
+        logging=verbose or FFMPEG_OUTPUT,
+        **{
+            "-f": "rtsp",
+            "-rtsp_transport": "tcp",
+            "-tune": "zerolatency",
+            "-preset": "ultrafast",
+            "-stimeout": "1000000",
+            "-input_framerate": YOLOV5_FRAMERATE,
+            "-r": source.framerate,
+        }
+    )
 
-        sink = WriteGear(
-            output_filename=SINK_STREAM,
-            logging=verbose,
-            **{"-f": "rtsp", "-rtsp_transport": "tcp"}
-        )
+    # Frame-wise loop
+    while True:
 
-        # Frame-wise loop
-        while True:
-            frame = source.read()
-            if frame is None:
-                break
+        frame_t0 = time.time()
 
-            # Do object detection
-            # pylint: disable=not-callable
-            result: yolov5.models.common.Detections = MODEL(
-                frame, size=max(frame.shape)
-            )
+        frame = source.read()
+        if frame is None:
+            break
 
-            annotated_frame = result.render()[0]
-            sink.write(annotated_frame)
+        LOGGER.debug("New frame read at: %s", datetime.now(timezone.utc))
 
-    except Exception:  # pylint: disable=broad-except
-        LOGGER.exception("Fundamental failure...")
+        t0 = time.time()
 
-    finally:
-        source.stop()
-        sink.close()
+        # Do object detection
+        # pylint: disable=not-callable
+        result: yolov5.models.common.Detections = MODEL(frame, size=max(frame.shape))
+
+        LOGGER.debug("Inference took %s seconds", time.time() - t0)
+        LOGGER.debug(result.print())
+
+        annotated_frame = result.render()[0]
+
+        LOGGER.debug("Annotated frame rendered with shape: %s", annotated_frame.shape)
+        sink.write(frame, rgb_mode=True)
+
+        time_to_sleep = 1 / YOLOV5_FRAMERATE - (time.time() - frame_t0)
+
+        if time_to_sleep < 0:
+            LOGGER.warning("YOLOV5_FRAMERATE not reached!")
+        else:
+            time.sleep(time_to_sleep)
+
+except Exception:  # pylint: disable=broad-except
+    LOGGER.exception("Fundamental failure...")
+
+finally:
+    source.stop()
+    sink.close()
