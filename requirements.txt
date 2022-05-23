@@ -1,3 +1,3 @@
-vidgear
+git+https://github.com/abhiTronix/vidgear@97576#egg=vidgear
 yolov5
 environs

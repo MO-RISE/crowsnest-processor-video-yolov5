@@ -5,8 +5,7 @@ import time
 from datetime import datetime, timezone
 
 import yolov5
-from vidgear.gears import CamGear
-from vidgear.gears import WriteGear
+from vidgear.gears import CamGear, WriteGear
 
 from environs import Env
 
